@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /Users/emredonger/Desktop/deepgen_stable -type f -name \"*.py\" -exec grep -l \"drift\\\\|inject\" {} \\\\;)",
+      "Bash(python3:*)"
+    ]
+  }
+}
