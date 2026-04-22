@@ -741,7 +741,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
                     # compute the previous noisy sample x_t -> x_t-1
                     latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
                     if inverted_latent_list is not None:
-                        latents[0] = inverted_latent_list[-(i+1)][0]
+                        latents[0] = inverted_latent_list[-i][0]
 
                 if latents.dtype != latents_dtype:
                     if torch.backends.mps.is_available():
