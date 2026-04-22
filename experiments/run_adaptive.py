@@ -1,5 +1,7 @@
 """Experiment runner for adaptive injection control in Stable Flow.
 
+All runs use real image editing (inversion + editing). An input image is required.
+
 Supports multiple modes:
   - original:        Unchanged Stable Flow (hard K/V copy)
   - pd_adaptive:     PD-controlled injection strength
@@ -10,18 +12,16 @@ Supports multiple modes:
 Usage:
     # Original Stable Flow
     python -m experiments.run_adaptive --mode original \\
-        --hf_token YOUR_TOKEN --prompts "A dog" "A cat"
-
-    # PD adaptive
-    python -m experiments.run_adaptive --mode pd_adaptive \\
-        --hf_token YOUR_TOKEN --prompts "A dog" "A cat" \\
-        --kp 0.5 --kd 0.1 --target_drift 0.1
-
-    # Real image editing with adaptive control
-    python -m experiments.run_adaptive --mode pd_adaptive \\
         --hf_token YOUR_TOKEN \\
         --input_img_path inputs/bottle.jpg \\
         --prompts "A photo of a bottle" "A photo of a bottle next to an apple"
+
+    # PD adaptive
+    python -m experiments.run_adaptive --mode pd_adaptive \\
+        --hf_token YOUR_TOKEN \\
+        --input_img_path inputs/bottle.jpg \\
+        --prompts "A photo of a bottle" "A photo of a bottle next to an apple" \\
+        --kp 0.5 --kd 0.1 --target_drift 0.1
 """
 
 import os
@@ -50,6 +50,12 @@ from .mask_utils import load_mask, default_mask
 # Vital layers from the Stable Flow paper
 MULTIMODAL_VITAL_LAYERS = [0, 1, 17, 18]
 SINGLE_MODAL_VITAL_LAYERS = list(np.array([28, 53, 54, 56, 25]) - 19)
+
+# Real image editing uses 50 inversion/editing steps with these guidance scales
+INVERSION_STEPS = 50
+INVERSION_GUIDANCE = 1
+EDITING_GUIDANCE_SOURCE = 1
+EDITING_GUIDANCE_EDITS = 3
 
 
 def build_controller(cfg: AdaptiveConfig):
@@ -132,75 +138,62 @@ def save_images(images, output_dir, prefix="result"):
     """Save a list of PIL images both individually and as a horizontal strip."""
     os.makedirs(output_dir, exist_ok=True)
     arrays = [np.array(img) for img in images]
-    # Save strip
     strip = Image.fromarray(np.hstack(arrays))
     strip.save(os.path.join(output_dir, f"{prefix}.jpg"))
-    # Save individual
     for i, img in enumerate(images):
         img.save(os.path.join(output_dir, f"{prefix}_{i}.jpg"))
 
 
+def invert_image(pipe, cfg: AdaptiveConfig):
+    """Run inversion pass to get latent trajectory from real image."""
+    print("Inverting image...")
+    inversion_prompt = cfg.prompts[0:1]
+    inverted_latent_list = pipe(
+        inversion_prompt,
+        height=cfg.height,
+        width=cfg.width,
+        guidance_scale=INVERSION_GUIDANCE,
+        output_type="pil",
+        num_inference_steps=INVERSION_STEPS,
+        max_sequence_length=512,
+        latents=image2latent(pipe, Image.open(cfg.input_img_path), cfg.device),
+        invert_image=True,
+    )
+    return inverted_latent_list
+
+
 @torch.no_grad()
 def run_original(pipe, cfg: AdaptiveConfig):
-    """Run original Stable Flow (identical to run_stable_flow.py)."""
+    """Run original Stable Flow (identical to run_stable_flow.py invert_and_save)."""
     prompts = cfg.prompts
+    inverted_latent_list = invert_image(pipe, cfg)
 
-    if cfg.input_img_path is None:
-        # Generated image editing
-        latents = torch.randn(
-            (4096, 64),
-            generator=torch.Generator(0).manual_seed(cfg.seed),
-            device=cfg.device,
-            dtype=torch.float16,
-        ).tile(len(prompts), 1, 1)
-
-        result = pipe(
-            prompts,
-            height=cfg.height,
-            width=cfg.width,
-            guidance_scale=cfg.guidance_scale,
-            output_type="pil",
-            num_inference_steps=cfg.num_inference_steps,
-            max_sequence_length=512,
-            latents=latents,
-            mm_copy_blocks=MULTIMODAL_VITAL_LAYERS,
-            single_copy_blocks=SINGLE_MODAL_VITAL_LAYERS,
-        )
-        return result.images
-    else:
-        # Real image editing (inversion + editing)
-        inversion_prompt = prompts[0:1]
-        inverted_latent_list = pipe(
-            inversion_prompt,
-            height=cfg.height,
-            width=cfg.width,
-            guidance_scale=1,
-            output_type="pil",
-            num_inference_steps=50,
-            max_sequence_length=512,
-            latents=image2latent(pipe, Image.open(cfg.input_img_path), cfg.device),
-            invert_image=True,
-        )
-        images = pipe(
-            prompts,
-            height=cfg.height,
-            width=cfg.width,
-            guidance_scale=[1] + [3] * (len(prompts) - 1),
-            output_type="pil",
-            num_inference_steps=50,
-            max_sequence_length=512,
-            latents=inverted_latent_list[-1].tile(len(prompts), 1, 1),
-            inverted_latent_list=inverted_latent_list,
-            mm_copy_blocks=MULTIMODAL_VITAL_LAYERS,
-            single_copy_blocks=SINGLE_MODAL_VITAL_LAYERS,
-        ).images
-        return images
+    print("Editing with original Stable Flow...")
+    images = pipe(
+        prompts,
+        height=cfg.height,
+        width=cfg.width,
+        guidance_scale=[EDITING_GUIDANCE_SOURCE] + [EDITING_GUIDANCE_EDITS] * (len(prompts) - 1),
+        output_type="pil",
+        num_inference_steps=INVERSION_STEPS,
+        max_sequence_length=512,
+        latents=inverted_latent_list[-1].tile(len(prompts), 1, 1),
+        inverted_latent_list=inverted_latent_list,
+        mm_copy_blocks=MULTIMODAL_VITAL_LAYERS,
+        single_copy_blocks=SINGLE_MODAL_VITAL_LAYERS,
+    ).images
+    return images
 
 
 @torch.no_grad()
 def run_adaptive(pipe, cfg: AdaptiveConfig):
-    """Run adaptive injection control experiment."""
+    """Run adaptive injection control experiment with real image editing."""
     prompts = cfg.prompts
+
+    # Inversion pass (no adapter needed)
+    inverted_latent_list = invert_image(pipe, cfg)
+
+    # Install adapter for editing pass
     adapter = TransformerAdapter(pipe.transformer)
     adapter.install()
 
@@ -209,102 +202,43 @@ def run_adaptive(pipe, cfg: AdaptiveConfig):
         controller.reset()
         drift_metric = build_drift_metric(cfg)
 
-        # Load mask
         if cfg.mask_path is not None:
             mask = load_mask(cfg.mask_path, cfg.height, cfg.width, cfg.device)
         else:
             mask = default_mask(device=cfg.device)
 
-        # Set up logger
         logger = None
         if cfg.log_steps:
             run_dir = os.path.join(cfg.output_dir, cfg.mode)
             logger = StepLogger(run_dir)
 
-        # Set initial alpha
         adapter.set_alpha(cfg.base_alpha)
 
-        if cfg.input_img_path is None:
-            # Generated image editing
-            num_steps = cfg.num_inference_steps
-            callback = AdaptiveCallback(
-                controller=controller,
-                drift_metric=drift_metric,
-                adapter=adapter,
-                mask=mask,
-                logger=logger,
-            )
-            callback.total_steps = num_steps
+        callback = AdaptiveCallback(
+            controller=controller,
+            drift_metric=drift_metric,
+            adapter=adapter,
+            mask=mask,
+            logger=logger,
+        )
+        callback.total_steps = INVERSION_STEPS
 
-            latents = torch.randn(
-                (4096, 64),
-                generator=torch.Generator(0).manual_seed(cfg.seed),
-                device=cfg.device,
-                dtype=torch.float16,
-            ).tile(len(prompts), 1, 1)
-
-            result = pipe(
-                prompts,
-                height=cfg.height,
-                width=cfg.width,
-                guidance_scale=cfg.guidance_scale,
-                output_type="pil",
-                num_inference_steps=num_steps,
-                max_sequence_length=512,
-                latents=latents,
-                mm_copy_blocks=MULTIMODAL_VITAL_LAYERS,
-                single_copy_blocks=SINGLE_MODAL_VITAL_LAYERS,
-                callback_on_step_end=callback,
-                callback_on_step_end_tensor_inputs=["latents"],
-            )
-            images = result.images
-        else:
-            # Real image editing: inversion (no adapter) + editing (with adapter)
-            # Temporarily uninstall for inversion pass
-            adapter.uninstall()
-            inversion_prompt = prompts[0:1]
-            inverted_latent_list = pipe(
-                inversion_prompt,
-                height=cfg.height,
-                width=cfg.width,
-                guidance_scale=1,
-                output_type="pil",
-                num_inference_steps=50,
-                max_sequence_length=512,
-                latents=image2latent(pipe, Image.open(cfg.input_img_path), cfg.device),
-                invert_image=True,
-            )
-
-            # Re-install adapter for editing pass
-            adapter.install()
-            adapter.set_alpha(cfg.base_alpha)
-            controller.reset()
-
-            num_steps = 50
-            callback = AdaptiveCallback(
-                controller=controller,
-                drift_metric=drift_metric,
-                adapter=adapter,
-                mask=mask,
-                logger=logger,
-            )
-            callback.total_steps = num_steps
-
-            images = pipe(
-                prompts,
-                height=cfg.height,
-                width=cfg.width,
-                guidance_scale=[1] + [3] * (len(prompts) - 1),
-                output_type="pil",
-                num_inference_steps=num_steps,
-                max_sequence_length=512,
-                latents=inverted_latent_list[-1].tile(len(prompts), 1, 1),
-                inverted_latent_list=inverted_latent_list,
-                mm_copy_blocks=MULTIMODAL_VITAL_LAYERS,
-                single_copy_blocks=SINGLE_MODAL_VITAL_LAYERS,
-                callback_on_step_end=callback,
-                callback_on_step_end_tensor_inputs=["latents"],
-            ).images
+        print(f"Editing with {cfg.mode} controller...")
+        images = pipe(
+            prompts,
+            height=cfg.height,
+            width=cfg.width,
+            guidance_scale=[EDITING_GUIDANCE_SOURCE] + [EDITING_GUIDANCE_EDITS] * (len(prompts) - 1),
+            output_type="pil",
+            num_inference_steps=INVERSION_STEPS,
+            max_sequence_length=512,
+            latents=inverted_latent_list[-1].tile(len(prompts), 1, 1),
+            inverted_latent_list=inverted_latent_list,
+            mm_copy_blocks=MULTIMODAL_VITAL_LAYERS,
+            single_copy_blocks=SINGLE_MODAL_VITAL_LAYERS,
+            callback_on_step_end=callback,
+            callback_on_step_end_tensor_inputs=["latents"],
+        ).images
 
         if logger is not None:
             logger.finalize()
@@ -319,17 +253,12 @@ def run_metrics(images, cfg: AdaptiveConfig):
     if not cfg.enable_metrics:
         return
 
-    if cfg.input_img_path is None:
-        print("Metrics require --input_img_path (real image editing). Skipping.")
-        return
-
     if cfg.mask_path is None:
-        print("Metrics require --mask_path for region-specific evaluation. "
-              "Computing full-image metrics.")
+        print("No --mask_path provided. Computing full-image metrics.")
 
     from .metrics import masked_l2, masked_lpips, load_evaluation_mask
 
-    source_img = np.array(images[0])  # Reconstructed source
+    source_img = np.array(images[0])
     eval_mask = None
     if cfg.mask_path is not None:
         eval_mask = load_evaluation_mask(cfg.mask_path, source_img.shape[0], source_img.shape[1])
@@ -354,9 +283,8 @@ def main():
     cfg = AdaptiveConfig.from_args()
 
     print(f"Mode: {cfg.mode}")
+    print(f"Input image: {cfg.input_img_path}")
     print(f"Prompts: {cfg.prompts}")
-    if cfg.input_img_path:
-        print(f"Input image: {cfg.input_img_path}")
 
     pipe = load_pipeline(cfg)
 
@@ -365,12 +293,10 @@ def main():
     else:
         images = run_adaptive(pipe, cfg)
 
-    # Save
     run_dir = os.path.join(cfg.output_dir, cfg.mode)
     save_images(images, run_dir)
     print(f"Images saved to {run_dir}/")
 
-    # Optional metrics
     run_metrics(images, cfg)
 
 

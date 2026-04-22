@@ -4,47 +4,77 @@ Experimental extension that adds closed-loop control of source-to-target attenti
 
 The original Stable Flow implementation is **completely untouched**. All experimental code lives in `experiments/`.
 
+## Prerequisites
+
+**HuggingFace token (required):** The model (`black-forest-labs/FLUX.1-dev`) is gated. You must:
+1. Create a token at https://huggingface.co/settings/tokens
+2. Accept the FLUX.1-dev license at https://huggingface.co/black-forest-labs/FLUX.1-dev
+3. Pass the token via `--hf_token` in every run
+
+## How It Works
+
+All runs edit a **real input image**. The pipeline:
+1. **Inverts** the input image into the latent noise trajectory (50 steps)
+2. **Edits** by denoising from the inverted noise with new prompts, injecting source K/V at vital layers
+
+The first prompt must **describe the input image**. The remaining prompts describe the desired edits.
+
+In adaptive modes, a controller modulates the injection strength `alpha` at each editing step based on how much the preserve-regions drift from the source:
+- `alpha = 1.0` is identical to original Stable Flow (hard K/V copy)
+- `alpha = 0.0` means no injection (free editing)
+- The PD controller increases alpha when drift is high, decreases it when drift is low
+
 ## Quick Start
 
-### Run Original Stable Flow (unchanged)
+### Original Stable Flow (unchanged)
 
 ```bash
 python run_stable_flow.py \
     --hf_token YOUR_TOKEN \
-    --prompts "A photo of a dog standing" "A photo of a dog sitting"
+    --input_img_path inputs/bottle.jpg \
+    --prompts "A photo of a bottle" "A photo of a bottle next to an apple"
 ```
 
-### Run Adaptive PD Controller
+### Original via experiment runner
 
 ```bash
-python -m experiments.run_adaptive --mode pd_adaptive \
+python -m experiments.run_adaptive --mode original \
     --hf_token YOUR_TOKEN \
-    --prompts "A photo of a dog standing" "A photo of a dog sitting" \
-    --kp 0.5 --kd 0.1 --target_drift 0.1 --base_alpha 0.8
+    --input_img_path inputs/bottle.jpg \
+    --prompts "A photo of a bottle" "A photo of a bottle next to an apple"
 ```
 
-### Run Fixed Soft Blending (constant alpha baseline)
-
-```bash
-python -m experiments.run_adaptive --mode fixed_soft \
-    --hf_token YOUR_TOKEN \
-    --prompts "A photo of a dog standing" "A photo of a dog sitting" \
-    --base_alpha 0.7
-```
-
-### Run with Real Image Editing
+### Adaptive PD Controller
 
 ```bash
 python -m experiments.run_adaptive --mode pd_adaptive \
     --hf_token YOUR_TOKEN \
     --input_img_path inputs/bottle.jpg \
     --prompts "A photo of a bottle" "A photo of a bottle next to an apple" \
-    --mask_path path/to/mask.png
+    --kp 0.5 --kd 0.1 --target_drift 0.1 --base_alpha 0.8
 ```
 
-### Run with Metrics
+### Fixed Soft Blending (constant alpha baseline)
 
-Add `--enable_metrics` to any real-image editing run:
+```bash
+python -m experiments.run_adaptive --mode fixed_soft \
+    --hf_token YOUR_TOKEN \
+    --input_img_path inputs/bottle.jpg \
+    --prompts "A photo of a bottle" "A photo of a bottle next to an apple" \
+    --base_alpha 0.7
+```
+
+### Scheduled Alpha (cosine decay)
+
+```bash
+python -m experiments.run_adaptive --mode scheduled_fixed \
+    --hf_token YOUR_TOKEN \
+    --input_img_path inputs/bottle.jpg \
+    --prompts "A photo of a bottle" "A photo of a bottle next to an apple" \
+    --schedule_type cosine --schedule_start 1.0 --schedule_end 0.2
+```
+
+### With Metrics
 
 ```bash
 python -m experiments.run_adaptive --mode pd_adaptive \
@@ -55,12 +85,13 @@ python -m experiments.run_adaptive --mode pd_adaptive \
     --enable_metrics
 ```
 
-### Run without Step Logging
+### Without Step Logging
 
 ```bash
 python -m experiments.run_adaptive --mode pd_adaptive \
     --hf_token YOUR_TOKEN \
-    --prompts "A dog" "A cat" \
+    --input_img_path inputs/bottle.jpg \
+    --prompts "A photo of a bottle" "A photo of a bottle next to an apple" \
     --no_log_steps
 ```
 
@@ -74,25 +105,18 @@ python -m experiments.run_adaptive --mode pd_adaptive \
 | `fixed_soft` | Constant alpha soft blending |
 | `scheduled_fixed` | Time-varying alpha (linear or cosine decay) |
 
-## How It Works
-
-At each denoising step:
-1. After the scheduler step, the callback computes **drift** between source (batch[0]) and edited (batch[1:]) latents in preserve-regions
-2. The drift is fed to a **PD controller** which outputs an injection strength `alpha`
-3. `alpha` is applied to the attention processors as soft blending: `K_target = alpha * K_source + (1-alpha) * K_target`
-4. When `alpha = 1.0`, this is identical to original Stable Flow (hard copy)
-
 ### Mask Convention
 
-Mask images: **white = preserve**, black = edit. The mask is downsampled to token space (4096 tokens for 1024x1024 images).
+Mask images: **white = preserve**, black = edit. The mask is downsampled to token space (4096 tokens for 1024x1024 images). Optional — without it, drift is measured globally.
 
 ## Output Structure
 
 ```
 outputs/adaptive/{mode}/
     result.jpg           # Horizontal strip of all images
-    result_0.jpg         # Individual images
-    result_1.jpg
+    result_0.jpg         # Reconstruction of input image
+    result_1.jpg         # Edit 1
+    result_2.jpg         # Edit 2 (if multiple edit prompts)
     step_log.jsonl       # Per-step drift and alpha values
     summary.json         # Trajectory summary
     metrics.json         # Optional evaluation metrics
@@ -122,12 +146,11 @@ outputs/adaptive/{mode}/
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--model_path` | black-forest-labs/FLUX.1-dev | HuggingFace model |
-| `--hf_token` | (required) | HuggingFace token |
-| `--prompts` | (required) | Source + edit prompts |
-| `--input_img_path` | None | Real image for editing |
+| `--hf_token` | (required) | HuggingFace access token |
+| `--input_img_path` | (required) | Path to the input image to edit |
+| `--prompts` | (required) | First = description of input image, rest = edit descriptions |
 | `--seed` | 42 | Random seed |
-| `--num_inference_steps` | 15 | Denoising steps |
-| `--cpu_offload` | false | Enable CPU offloading |
+| `--cpu_offload` | false | Enable CPU offloading for low VRAM |
 
 ### Output Parameters
 | Flag | Default | Description |
@@ -135,7 +158,7 @@ outputs/adaptive/{mode}/
 | `--output_dir` | outputs/adaptive | Base output directory |
 | `--no_log_steps` | false | Disable step logging |
 | `--enable_metrics` | false | Compute evaluation metrics |
-| `--mask_path` | None | Path to mask image |
+| `--mask_path` | None | Mask image (white=preserve, black=edit) |
 
 ## Files Added
 

@@ -38,7 +38,7 @@ class AdaptiveConfig:
     model_path: str = "black-forest-labs/FLUX.1-dev"
     hf_token: str = ""
     prompts: List[str] = field(default_factory=list)
-    input_img_path: Optional[str] = None
+    input_img_path: str = ""
     seed: int = 42
     device: str = "cuda"
     cpu_offload: bool = False
@@ -87,7 +87,7 @@ class AdaptiveConfig:
         parser.add_argument("--model_path", type=str, default="black-forest-labs/FLUX.1-dev")
         parser.add_argument("--hf_token", type=str, required=True)
         parser.add_argument("--prompts", type=str, nargs="+", required=True)
-        parser.add_argument("--input_img_path", type=str, default=None)
+        parser.add_argument("--input_img_path", type=str, required=True)
         parser.add_argument("--seed", type=int, default=42)
         parser.add_argument("--device", type=str, default="cuda")
         parser.add_argument("--cpu_offload", action="store_true")

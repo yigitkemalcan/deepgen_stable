@@ -2,7 +2,12 @@
   "permissions": {
     "allow": [
       "Bash(find /Users/emredonger/Desktop/deepgen_stable -type f -name \"*.py\" -exec grep -l \"drift\\\\|inject\" {} \\\\;)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(conda --version)",
+      "Bash(system_profiler SPDisplaysDataType)",
+      "Bash(conda env:*)",
+      "Bash(conda create:*)",
+      "Bash(conda run:*)"
     ]
   }
 }
